@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package chat;
+
+option go_package = "github.com/Ayobami0/cli-chat-server/pb";
+
+message UserCreatedResponse {
+  string User = 2;
+}
+
+message UserAuthenticatedResponse {
+  string User = 2;
+  string token = 3;
+}
+
+message UserRequest {
+  string username = 1;
+  string password = 2;
+}
