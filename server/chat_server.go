@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"log"
-	"os"
 	"time"
 
 	"github.com/Ayobami0/cli-chat-server/pb"
@@ -25,19 +24,11 @@ type Server struct {
 }
 
 func NewChatServer() *Server {
-	var dbStore store.MongoDBStorage //TODO: Use an interface for this instead
+	var dbStore store.MongoDBStorage
 
-	dbStoreName := os.Getenv("STORAGE")
-
-	switch dbStoreName {
-	case "mongodb":
-		err := dbStore.Init("chat_db")
-		if err != nil {
-			log.Fatalf(err.Error())
-		}
-	default:
-		log.Fatalf("No such store %s\n", dbStoreName)
-
+	err := dbStore.Init("chat_db")
+	if err != nil {
+		log.Fatalf(err.Error())
 	}
 	return &Server{Store: dbStore}
 }
