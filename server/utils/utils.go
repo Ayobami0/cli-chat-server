@@ -4,7 +4,7 @@ import (
 	"strings"
 
 	"github.com/Ayobami0/cli-chat-server/pb"
-	"github.com/Ayobami0/cli-chat-server/server/store/models"
+	"github.com/Ayobami0/cli-chat-server/server/models"
 	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )

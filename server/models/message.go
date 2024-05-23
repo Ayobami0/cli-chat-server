@@ -14,3 +14,7 @@ type Message struct {
 	Type      pb.Message_MessageType `bson:"type"`
 	CreatedAt time.Time              `bson:"created_at"`
 }
+
+func (m Message) GetID() string {
+	return m.ID.Hex()
+}

@@ -6,8 +6,8 @@ import (
 	"time"
 
 	"github.com/Ayobami0/cli-chat-server/pb"
+	"github.com/Ayobami0/cli-chat-server/server/models"
 	"github.com/Ayobami0/cli-chat-server/server/store"
-	"github.com/Ayobami0/cli-chat-server/server/store/models"
 	"github.com/Ayobami0/cli-chat-server/server/utils"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -18,19 +18,26 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
+const (
+	DATABASE_NAME = "chat_db"
+
+	USERS_COLLECTION                = "users"
+	DIRECT_CHAT_REQUESTS_COLLECTION = "direct_chat_requests"
+	CHATS_COLLECTION                = "chats"
+)
+
 type Server struct {
 	pb.ChatServiceServer
-	Store store.MongoDBStorage
+	Store store.Storage
 }
 
-func NewChatServer() *Server {
-	var dbStore store.MongoDBStorage
+func NewChatServer(storage store.Storage) *Server {
 
-	err := dbStore.Init("chat_db")
+	err := storage.Init(DATABASE_NAME)
 	if err != nil {
 		log.Fatalf(err.Error())
 	}
-	return &Server{Store: dbStore}
+	return &Server{Store: storage}
 }
 
 func (s *Server) CreateNewAccount(c context.Context, r *pb.UserRequest) (*pb.UserCreatedResponse, error) {
@@ -38,22 +45,26 @@ func (s *Server) CreateNewAccount(c context.Context, r *pb.UserRequest) (*pb.Use
 
 	filter := bson.D{{Key: "username", Value: uName}}
 
-	if err := s.Store.DB.Collection("users").FindOne(c, filter).Err(); err == nil {
-		if err != mongo.ErrNoDocuments {
-			return nil, status.Errorf(codes.AlreadyExists, "User with username '%s' already exist.", uName)
-		}
+	exist, err := s.Store.Exists(c, USERS_COLLECTION, filter)
+
+	if err != nil {
+		return nil, status.Errorf(codes.Unknown, err.Error())
+	}
+	if exist {
+		return nil, status.Errorf(codes.AlreadyExists, "User with username '%s' already exist.", uName)
+
 	}
 
 	hashedPWord, err := utils.HashPassword(pWord)
 	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "An error occured")
+		return nil, status.Errorf(codes.Unauthenticated, "Invalid password")
 	}
 
 	user := models.User{Username: uName, PasswordHash: hashedPWord, ID: primitive.NewObjectID()}
 
-	_, err = s.Store.DB.Collection("users").InsertOne(c, &user)
+	err = s.Store.Add(c, USERS_COLLECTION, &user)
 	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, err.Error())
+		return nil, status.Errorf(codes.Unknown, err.Error())
 	}
 
 	return &pb.UserCreatedResponse{User: r.Username}, nil
@@ -65,10 +76,13 @@ func (s *Server) LogIntoAccount(c context.Context, r *pb.UserRequest) (*pb.UserA
 	filter := bson.D{{Key: "username", Value: uName}}
 	var user models.User
 
-	err := s.Store.DB.Collection("users").FindOne(c, filter).Decode(&user)
+	err := s.Store.Get(c, USERS_COLLECTION, &user, filter)
 
-	if err == mongo.ErrNoDocuments {
-		return nil, status.Errorf(codes.NotFound, "User with username %s does not exist.", uName)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, status.Errorf(codes.NotFound, "User with username %s does not exist.", uName)
+		}
+		return nil, status.Errorf(codes.Unknown, err.Error())
 	}
 
 	if !utils.CheckPasswordHash(pWord, user.PasswordHash) {
@@ -101,7 +115,7 @@ func (s *Server) DirectChatRequestAction(c context.Context, r *pb.DirectChatActi
 
 	var directChatRequest models.DirectChatRequest
 
-	err = s.Store.DB.Collection("direct_chat_requests").FindOneAndDelete(c, filter).Decode(&directChatRequest)
+	err = s.Store.GetAndDelete(c, DIRECT_CHAT_REQUESTS_COLLECTION, &directChatRequest, filter)
 
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
@@ -121,7 +135,7 @@ func (s *Server) DirectChatRequestAction(c context.Context, r *pb.DirectChatActi
 			Type: pb.ChatType_CHAT_TYPE_DIRECT,
 			ID:   primitive.NewObjectID(),
 		}
-		_, err := s.Store.DB.Collection("chats").InsertOne(c, &newChat)
+		err := s.Store.Add(c, CHATS_COLLECTION, &newChat)
 
 		if err != nil {
 			return nil, status.Errorf(codes.Unknown, err.Error())
@@ -142,12 +156,8 @@ func (s *Server) GetDirectChatRequests(c context.Context, r *emptypb.Empty) (*pb
 		Key:   "receiver",
 		Value: user,
 	}}
-	cursor, err := s.Store.DB.Collection("direct_chat_requests").Find(c, filter)
-	if err != nil {
-		return nil, status.Errorf(codes.Unknown, err.Error())
-	}
 	var results []models.DirectChatRequest
-	err = cursor.All(c, &results)
+	err := s.Store.GetAll(c, DIRECT_CHAT_REQUESTS_COLLECTION, &results, filter)
 
 	if err != nil {
 		return nil, status.Errorf(codes.Unknown, err.Error())
@@ -167,24 +177,14 @@ func (s *Server) GetDirectChatRequests(c context.Context, r *emptypb.Empty) (*pb
 func (s *Server) GetChats(c context.Context, r *emptypb.Empty) (*pb.ChatsResponse, error) {
 	user := c.Value(utils.USERNAME_HEADER).(models.User)
 
-	matchStage := bson.D{
+	filter := bson.D{
 		{
-			Key: "$match",
-			Value: bson.D{
-				{
-					Key:   "members",
-					Value: user,
-				},
-			},
+			Key:   "members",
+			Value: user,
 		},
 	}
-	coll := s.Store.DB.Collection("chats")
-	cursor, err := coll.Aggregate(c, mongo.Pipeline{matchStage})
-	if err != nil {
-		return nil, status.Errorf(codes.Unknown, err.Error())
-	}
 	var results []models.Chat
-	err = cursor.All(c, &results)
+	err := s.Store.GetAll(c, CHATS_COLLECTION, &results, filter)
 
 	if err != nil {
 		return nil, status.Errorf(codes.Unknown, err.Error())
@@ -200,36 +200,52 @@ func (s *Server) GetChats(c context.Context, r *emptypb.Empty) (*pb.ChatsRespons
 }
 
 func (s *Server) JoinDirectChat(c context.Context, r *pb.JoinDirectChatRequest) (*pb.JoinDirectChatResponse, error) {
-	receiverName := r.Receiver.Username
 	sender := c.Value(utils.USERNAME_HEADER).(models.User)
+	receiverId, err := primitive.ObjectIDFromHex(r.Receiver.Id)
 
-	recvFilter := bson.D{{Key: "username", Value: receiverName}}
-	var receiver models.User
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Id is not an hexadecimal string")
+	}
 
-	if receiverName == sender.Username {
+	receiver := models.User{
+		Username: r.Receiver.Username,
+		ID:       receiverId,
+	}
+	recvFilter := bson.D{{Key: "username", Value: receiver.Username}}
+
+	if receiver.Username == sender.Username {
 		return nil, status.Errorf(codes.InvalidArgument, "Cannot send request to self")
 	}
 
-	err := s.Store.DB.Collection("users").FindOne(c, recvFilter).Decode(&receiver)
-	if err == mongo.ErrNoDocuments {
-		return nil, status.Errorf(codes.NotFound, "User with username %s does not exist.", receiverName)
+	exist, err := s.Store.Exists(c, USERS_COLLECTION, recvFilter)
+
+	if err != nil {
+		return nil, status.Errorf(codes.Unknown, err.Error())
+	}
+	if !exist {
+		return nil, status.Errorf(codes.NotFound, "User with username %s does not exist.", receiver.Username)
 	}
 
 	existingFilter := bson.D{{Key: "sender", Value: sender}, {Key: "receiver", Value: receiver}}
-	if s.Store.DB.Collection("direct_chat_requests").FindOne(c, existingFilter).Err() == nil {
+	match, err := s.Store.Exists(c, DIRECT_CHAT_REQUESTS_COLLECTION, existingFilter)
+
+	if err != nil {
+		return nil, status.Errorf(codes.Unknown, err.Error())
+	}
+	if match {
 		return nil, status.Errorf(codes.Aborted, "Cannot send multiple request to same user")
 	}
 
 	chatRequest := models.DirectChatRequest{
-		Sender:    models.User{Username: sender.Username, ID: sender.ID},
-		Receiver:  models.User{Username: receiverName, ID: receiver.ID},
+		Sender:    sender,
+		Receiver:  receiver,
 		CreatedAt: time.Now(),
 		ID:        primitive.NewObjectID(),
 	}
 
-	s.Store.DB.Collection("direct_chat_requests").InsertOne(c, &chatRequest)
+	s.Store.Add(c, DIRECT_CHAT_REQUESTS_COLLECTION, &chatRequest)
 
-	return &pb.JoinDirectChatResponse{Id: chatRequest.ID.Hex()}, nil
+	return &pb.JoinDirectChatResponse{Id: chatRequest.ID.Hex(), Sender: &pb.User{Username: sender.Username, Id: sender.ID.Hex()}}, nil
 }
 
 func (s *Server) JoinGroupChat(c context.Context, r *pb.GroupChatRequest) (*pb.ChatResponse, error) {
@@ -238,6 +254,7 @@ func (s *Server) JoinGroupChat(c context.Context, r *pb.GroupChatRequest) (*pb.C
 	filter := bson.D{
 		{Key: "name", Value: r.GroupName},
 		{Key: "passkey", Value: r.GroupPasskey},
+		{Key: "type", Value: pb.ChatType_CHAT_TYPE_GROUP},
 	}
 	filterPresense := bson.D{
 		{Key: "members", Value: user},
@@ -251,18 +268,16 @@ func (s *Server) JoinGroupChat(c context.Context, r *pb.GroupChatRequest) (*pb.C
 			}},
 		},
 	}
-	s.Store.DB.Collection("chats").Aggregate(c, mongo.Pipeline{
-		filter,
-	})
-	if err := s.Store.DB.Collection("chats").FindOne(c, filterPresense).Err(); err != mongo.ErrNoDocuments {
-		if err == nil {
-			return nil, status.Errorf(codes.AlreadyExists, "User is already a member of the group")
-		}
+	exist, err := s.Store.Exists(c, CHATS_COLLECTION, filterPresense)
+	if err != nil {
 		return nil, status.Errorf(codes.Unknown, err.Error())
+	}
+	if exist {
+		return nil, status.Errorf(codes.AlreadyExists, "User is already a member of the group")
 	}
 
 	var chat models.Chat
-	err := s.Store.DB.Collection("chats").FindOneAndUpdate(c, filter, update).Decode(&chat)
+	err = s.Store.GetAndUpdate(c, CHATS_COLLECTION, &chat, filter, update)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
 			return nil, status.Errorf(codes.NotFound, "Group name or passkey incorrect.")
@@ -278,11 +293,12 @@ func (s *Server) CreateGroupChat(c context.Context, r *pb.GroupChatRequest) (*pb
 
 	filter := bson.D{{Key: "name", Value: r.GroupName}}
 
-	if err := s.Store.DB.Collection("chats").FindOne(c, filter).Err(); err != mongo.ErrNoDocuments {
-		if err == nil {
-			return nil, status.Errorf(codes.AlreadyExists, "Group name '%s' already exist.", r.GroupName)
-		}
+	exist, err := s.Store.Exists(c, CHATS_COLLECTION, filter)
+	if err != nil {
 		return nil, status.Errorf(codes.Unknown, err.Error())
+	}
+	if exist {
+		return nil, status.Errorf(codes.AlreadyExists, "Group name '%s' already exist.", r.GroupName)
 	}
 
 	chat := models.Chat{
@@ -294,7 +310,7 @@ func (s *Server) CreateGroupChat(c context.Context, r *pb.GroupChatRequest) (*pb
 		PassKey:   r.GroupPasskey,
 		Name:      r.GroupName,
 	}
-	_, err := s.Store.DB.Collection("chats").InsertOne(c, &chat)
+	err = s.Store.Add(c, CHATS_COLLECTION, &chat)
 
 	if err != nil {
 		return nil, status.Errorf(codes.Unknown, err.Error())

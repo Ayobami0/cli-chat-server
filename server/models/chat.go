@@ -16,3 +16,7 @@ type Chat struct {
 	Members   []User             `bson:"members"`
 	Messages  []Message          `bson:"messages"`
 }
+
+func (c Chat) GetID() string {
+	return c.ID.Hex()
+}

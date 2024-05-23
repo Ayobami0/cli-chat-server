@@ -12,3 +12,7 @@ type DirectChatRequest struct {
 	Receiver  User               `bson:"receiver"`
 	CreatedAt time.Time          `bson:"created_at"`
 }
+
+func (d DirectChatRequest) GetID() string {
+	return d.ID.Hex()
+}

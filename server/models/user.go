@@ -7,3 +7,7 @@ type User struct {
 	Username     string             `bson:"username"`
 	PasswordHash string             `bson:"password_hash,omitempty"`
 }
+
+func (u User) GetID() string {
+	return u.ID.Hex()
+}

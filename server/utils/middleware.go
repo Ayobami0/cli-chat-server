@@ -4,7 +4,7 @@ import (
 	"context"
 	"strings"
 
-	"github.com/Ayobami0/cli-chat-server/server/store/models"
+	"github.com/Ayobami0/cli-chat-server/server/models"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
