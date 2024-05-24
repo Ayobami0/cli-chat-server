@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"io"
 	"log"
 	"time"
 
@@ -97,8 +98,100 @@ func (s *Server) LogIntoAccount(c context.Context, r *pb.UserRequest) (*pb.UserA
 	return &pb.UserAuthenticatedResponse{User: uName, Token: token}, nil
 }
 
-func (s *Server) ChatStream(pb.ChatService_ChatStreamServer) error {
-	return nil
+func (s *Server) ChatStream(stream pb.ChatService_ChatStreamServer) error {
+	for {
+		in, err := stream.Recv()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return status.Errorf(codes.Unknown, err.Error())
+		}
+
+		chatId, err := primitive.ObjectIDFromHex(in.ChatId)
+		if err != nil {
+			return status.Errorf(codes.InvalidArgument, "Id is not an hexadecimal string")
+		}
+		userId, err := primitive.ObjectIDFromHex(in.Message.Sender.Id)
+		if err != nil {
+			return status.Errorf(codes.InvalidArgument, "Id is not an hexadecimal string")
+		}
+		sender := models.User{ID: userId, Username: in.Message.Sender.Username}
+
+		chatFilter := bson.D{{Key: "_id", Value: chatId}}
+		userFilter := bson.D{{Key: "username", Value: sender.Username}}
+		presenseFilter := bson.D{
+			chatFilter[0],
+			{Key: "members", Value: sender},
+		}
+
+		// Checks if user exist
+		userExist, err := s.Store.Exists(context.TODO(), USERS_COLLECTION, userFilter)
+		if err != nil {
+			return status.Errorf(codes.Unknown, err.Error())
+		}
+		if !userExist {
+			return status.Errorf(codes.NotFound, "User with name '%s' not found", sender.Username)
+		}
+
+		// Checks if chat exist
+		chatExist, err := s.Store.Exists(context.TODO(), CHATS_COLLECTION, chatFilter)
+		if err != nil {
+			return status.Errorf(codes.Unknown, err.Error())
+		}
+		if !chatExist {
+			return status.Errorf(codes.NotFound, "Chat with id '%s' not found", in.ChatId)
+		}
+
+		// Checks if user is a member of the chat exist
+		userInChat, err := s.Store.Exists(context.TODO(), CHATS_COLLECTION, presenseFilter)
+		if err != nil {
+			return status.Errorf(codes.Unknown, err.Error())
+		}
+		if !userInChat {
+		}
+
+		message := &models.Message{
+			ID:        primitive.NewObjectID(),
+			Sender:    sender,
+			Content:   in.Message.Content,
+			Type:      in.Message.Type,
+			CreatedAt: in.Message.SentAt.AsTime(),
+		}
+
+		update := bson.D{
+			{
+				Key: "$push",
+				Value: bson.D{{
+					Key:   "messages",
+					Value: message,
+				}},
+			},
+		}
+
+		err = s.Store.Update(context.TODO(), CHATS_COLLECTION, chatFilter, update)
+
+		if err != nil {
+			if err == mongo.ErrNoDocuments {
+				return status.Errorf(codes.NotFound, "User is not a member part of the chat")
+			}
+			return status.Errorf(codes.Unknown, err.Error())
+		}
+
+		if err := stream.Send(&pb.MessageStream{
+			ChatId: in.ChatId,
+			Message: &pb.Message{
+				Id:      message.ID.Hex(),
+				Sender:  in.Message.Sender,
+				Type:    message.Type,
+				Content: in.Message.Content,
+				SentAt:  in.Message.SentAt,
+			},
+		}); err != nil {
+			return status.Errorf(codes.Unknown, err.Error())
+		}
+
+	}
 }
 
 func (s *Server) DirectChatRequestAction(c context.Context, r *pb.DirectChatAction) (*emptypb.Empty, error) {
