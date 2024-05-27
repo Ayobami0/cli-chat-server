@@ -95,7 +95,7 @@ func (s *Server) LogIntoAccount(c context.Context, r *pb.UserRequest) (*pb.UserA
 		return nil, err
 	}
 
-	return &pb.UserAuthenticatedResponse{User: uName, Token: token}, nil
+	return &pb.UserAuthenticatedResponse{User: &pb.User{Username: user.Username, Id: user.ID.Hex()}, Token: token}, nil
 }
 
 func (s *Server) ChatStream(stream pb.ChatService_ChatStreamServer) error {
@@ -112,11 +112,7 @@ func (s *Server) ChatStream(stream pb.ChatService_ChatStreamServer) error {
 		if err != nil {
 			return status.Errorf(codes.InvalidArgument, "Id is not an hexadecimal string")
 		}
-		userId, err := primitive.ObjectIDFromHex(in.Message.Sender.Id)
-		if err != nil {
-			return status.Errorf(codes.InvalidArgument, "Id is not an hexadecimal string")
-		}
-		sender := models.User{ID: userId, Username: in.Message.Sender.Username}
+		sender := models.User{Username: in.Message.Sender.Username}
 
 		chatFilter := bson.D{{Key: "_id", Value: chatId}}
 		userFilter := bson.D{{Key: "username", Value: sender.Username}}
@@ -350,6 +346,7 @@ func (s *Server) JoinGroupChat(c context.Context, r *pb.GroupChatRequest) (*pb.C
 		{Key: "type", Value: pb.ChatType_CHAT_TYPE_GROUP},
 	}
 	filterPresense := bson.D{
+		filter[0],
 		{Key: "members", Value: user},
 	}
 	update := bson.D{
@@ -413,4 +410,8 @@ func (s *Server) CreateGroupChat(c context.Context, r *pb.GroupChatRequest) (*pb
 
 func WithServerUnaryInterceptor() grpc.ServerOption {
 	return grpc.UnaryInterceptor(utils.UnaryInterceptor)
+}
+
+func WithServerStreamInterceptor() grpc.ServerOption {
+	return grpc.StreamInterceptor(utils.StreamInterceptor)
 }

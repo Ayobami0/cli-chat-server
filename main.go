@@ -46,7 +46,7 @@ func main() {
 		log.Fatalf("Invalid storage type")
 	}
 
-	grpcServer := grpc.NewServer(server.WithServerUnaryInterceptor())
+	grpcServer := grpc.NewServer(server.WithServerUnaryInterceptor(), server.WithServerStreamInterceptor())
 	pb.RegisterChatServiceServer(grpcServer, server.NewChatServer(storage))
 	grpcServer.Serve(lis)
 }

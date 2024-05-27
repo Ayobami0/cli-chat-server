@@ -56,3 +56,59 @@ func UnaryInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, 
 	}
 	return m, nil
 }
+
+// wrappedStream wraps around the embedded grpc.ServerStream, and intercepts the RecvMsg and
+// SendMsg method call.
+type wrappedStream struct {
+	grpc.ServerStream
+}
+
+func (w *wrappedStream) RecvMsg(m any) error {
+	return w.ServerStream.RecvMsg(m)
+}
+
+func (w *wrappedStream) SendMsg(m any) error {
+	return w.ServerStream.SendMsg(m)
+}
+
+func newWrappedStream(s grpc.ServerStream) grpc.ServerStream {
+	return &wrappedStream{s}
+}
+
+func StreamInterceptor(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	// authentication (token verification)
+	meta, ok := metadata.FromIncomingContext(ss.Context())
+	if !ok {
+		return ErrMissingMetadata
+	}
+	if AuthRequired(info.FullMethod) {
+
+		bearerToken := meta["authorization"]
+
+		if len(bearerToken) == 0 {
+			return status.Errorf(codes.Unauthenticated, "authorization token is missing")
+		}
+
+		bearer := strings.Fields(bearerToken[0])
+
+		if len(bearer) != 2 || bearer[0] != "Bearer" {
+			return status.Errorf(codes.InvalidArgument, "invalid authorization scheme. need Bearer <credential>")
+		}
+
+		_, userIdHex, err := ValidateToken(bearer[1])
+		if err != nil {
+			return err
+		}
+		_, err = primitive.ObjectIDFromHex(userIdHex)
+
+		if err != nil {
+			return status.Errorf(codes.InvalidArgument, "invalid format for hex")
+		}
+	}
+
+	err := handler(srv, newWrappedStream(ss))
+	if err != nil {
+		return status.Errorf(codes.Unknown, err.Error())
+	}
+	return err
+}
