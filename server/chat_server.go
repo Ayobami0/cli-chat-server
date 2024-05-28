@@ -2,8 +2,11 @@ package server
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/Ayobami0/cli-chat-server/pb"
@@ -15,8 +18,10 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 const (
@@ -25,11 +30,17 @@ const (
 	USERS_COLLECTION                = "users"
 	DIRECT_CHAT_REQUESTS_COLLECTION = "direct_chat_requests"
 	CHATS_COLLECTION                = "chats"
+
+	CHAT_STREAM_HANDSHAKE_KEY_ID       = "stream_chat_id"
+	CHAT_STREAM_HANDSHAKE_KEY_USERNAME = "stream_username"
 )
 
 type Server struct {
 	pb.ChatServiceServer
 	Store store.Storage
+
+	mu          sync.RWMutex
+	connections map[string]map[string]pb.ChatService_ChatStreamServer
 }
 
 func NewChatServer(storage store.Storage) *Server {
@@ -38,7 +49,7 @@ func NewChatServer(storage store.Storage) *Server {
 	if err != nil {
 		log.Fatalf(err.Error())
 	}
-	return &Server{Store: storage}
+	return &Server{Store: storage, connections: map[string]map[string]pb.ChatService_ChatStreamServer{}, mu: sync.RWMutex{}}
 }
 
 func (s *Server) CreateNewAccount(c context.Context, r *pb.UserRequest) (*pb.UserCreatedResponse, error) {
@@ -98,54 +109,164 @@ func (s *Server) LogIntoAccount(c context.Context, r *pb.UserRequest) (*pb.UserA
 	return &pb.UserAuthenticatedResponse{User: &pb.User{Username: user.Username, Id: user.ID.Hex()}, Token: token}, nil
 }
 
+func (s *Server) _isSession(key string) bool {
+	_, ok := s.connections[key]
+
+	return ok
+}
+
+func (s *Server) broadcast(key string, message *pb.MessageStream) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if !s._isSession(key) {
+		return errors.New("Invalid session")
+	}
+
+	for _, s := range s.connections[key] {
+		if err := s.Send(message); err != nil {
+			return status.Errorf(codes.Unknown, err.Error())
+		}
+		log.Println(s)
+	}
+
+	return nil
+}
+
+func (s *Server) addStream(key string, user string, stream pb.ChatService_ChatStreamServer) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s._isSession(key) {
+		s.connections[key] = map[string]pb.ChatService_ChatStreamServer{}
+	}
+	s.connections[key][user] = stream
+	return nil
+}
+
+func (s *Server) removeSession(key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s._isSession(key) {
+		return errors.New("Invalid session")
+	}
+	if len(s.connections[key]) != 0 {
+		return errors.New("Cannot remove session. Active streams present")
+	}
+	delete(s.connections, key)
+	return nil
+}
+
+func (s *Server) removeStream(key, user string, stream pb.ChatService_ChatStreamServer) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	conn := make([]pb.ChatService_ChatStreamServer, 0)
+
+	if !s._isSession(key) {
+		return errors.New("Invalid session")
+	}
+
+	for _, v := range s.connections[key] {
+		if v != stream {
+			conn = append(conn, v)
+		}
+	}
+
+	delete(s.connections[key], user)
+
+	return nil
+}
+
 func (s *Server) ChatStream(stream pb.ChatService_ChatStreamServer) error {
+	// STREAM HANDSHAKE
+	md, ok := metadata.FromIncomingContext(stream.Context())
+	if !ok {
+		return utils.ErrMissingMetadata
+	}
+
+	cID := md.Get(CHAT_STREAM_HANDSHAKE_KEY_ID)
+	cUsername := md.Get(CHAT_STREAM_HANDSHAKE_KEY_USERNAME)
+
+	if len(cID) == 0 {
+		return status.Errorf(codes.InvalidArgument, "Invalid metadata value '%s'", CHAT_STREAM_HANDSHAKE_KEY_ID)
+	}
+	if len(cUsername) == 0 {
+		return status.Errorf(codes.InvalidArgument, "Invalid metadata value '%s'", CHAT_STREAM_HANDSHAKE_KEY_USERNAME)
+	}
+
+	chatId, err := primitive.ObjectIDFromHex(cID[0])
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "Id is not an hexadecimal string")
+	}
+	// Checks if chat exist
+	chatFilter := bson.D{{Key: "_id", Value: chatId}}
+
+	chatExist, err := s.Store.Exists(context.TODO(), CHATS_COLLECTION, chatFilter)
+	if err != nil {
+		return status.Errorf(codes.Unknown, err.Error())
+	}
+	if !chatExist {
+		return status.Errorf(codes.NotFound, "Chat with id '%s' not found", cID[0])
+	}
+	userFilter := bson.D{{Key: "username", Value: cUsername[0]}}
+
+	// Checks if user exist
+	var user models.User
+	err = s.Store.Get(context.TODO(), USERS_COLLECTION, &user, userFilter)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return status.Errorf(codes.NotFound, "User with username %s does not exist.", cUsername[0])
+		}
+		return status.Errorf(codes.Unknown, err.Error())
+	}
+
+	presenseFilter := bson.D{
+		chatFilter[0],
+		{Key: "members", Value: models.User{Username: user.Username, ID: user.ID}},
+	}
+	// Checks if user is a member of the chat
+	userInChat, err := s.Store.Exists(context.TODO(), CHATS_COLLECTION, presenseFilter)
+	if err != nil {
+		return status.Errorf(codes.Unknown, err.Error())
+	}
+	if !userInChat {
+		return status.Errorf(codes.NotFound, "User '%s' is not a member of this chat", cUsername[0])
+	}
+
+	s.addStream(cID[0], cUsername[0], stream)
+
+	s.broadcast(cID[0], &pb.MessageStream{
+		Message: &pb.Message{
+			Content: fmt.Sprintf("User [%s] has joined. Say Hi.", user.Username),
+			Type:    pb.Message_MESSAGE_TYPE_NOTIFICATION,
+			SentAt:  timestamppb.Now(),
+		},
+		ChatId: cID[0],
+	})
+
+	log.Println(user.Username, "CONNECTED", s.connections)
+	// POST HANDSHAKE
 	for {
 		in, err := stream.Recv()
 		if err == io.EOF {
+			s.removeStream(cID[0], cUsername[0], stream)
+			s.broadcast(cID[0], &pb.MessageStream{
+				Message: &pb.Message{
+					Content: fmt.Sprintf("User [%s] has just left.", user.Username),
+					Type:    pb.Message_MESSAGE_TYPE_NOTIFICATION,
+					SentAt:  timestamppb.Now(),
+				},
+				ChatId: cID[0],
+			})
+			log.Println("DISCONNECTED", user.Username)
 			return nil
 		}
 		if err != nil {
 			return status.Errorf(codes.Unknown, err.Error())
 		}
 
-		chatId, err := primitive.ObjectIDFromHex(in.ChatId)
-		if err != nil {
-			return status.Errorf(codes.InvalidArgument, "Id is not an hexadecimal string")
-		}
 		sender := models.User{Username: in.Message.Sender.Username}
-
-		chatFilter := bson.D{{Key: "_id", Value: chatId}}
-		userFilter := bson.D{{Key: "username", Value: sender.Username}}
-		presenseFilter := bson.D{
-			chatFilter[0],
-			{Key: "members", Value: sender},
-		}
-
-		// Checks if user exist
-		userExist, err := s.Store.Exists(context.TODO(), USERS_COLLECTION, userFilter)
-		if err != nil {
-			return status.Errorf(codes.Unknown, err.Error())
-		}
-		if !userExist {
-			return status.Errorf(codes.NotFound, "User with name '%s' not found", sender.Username)
-		}
-
-		// Checks if chat exist
-		chatExist, err := s.Store.Exists(context.TODO(), CHATS_COLLECTION, chatFilter)
-		if err != nil {
-			return status.Errorf(codes.Unknown, err.Error())
-		}
-		if !chatExist {
-			return status.Errorf(codes.NotFound, "Chat with id '%s' not found", in.ChatId)
-		}
-
-		// Checks if user is a member of the chat exist
-		userInChat, err := s.Store.Exists(context.TODO(), CHATS_COLLECTION, presenseFilter)
-		if err != nil {
-			return status.Errorf(codes.Unknown, err.Error())
-		}
-		if !userInChat {
-		}
 
 		message := &models.Message{
 			ID:        primitive.NewObjectID(),
@@ -174,7 +295,7 @@ func (s *Server) ChatStream(stream pb.ChatService_ChatStreamServer) error {
 			return status.Errorf(codes.Unknown, err.Error())
 		}
 
-		if err := stream.Send(&pb.MessageStream{
+		s.broadcast(cID[0], &pb.MessageStream{
 			ChatId: in.ChatId,
 			Message: &pb.Message{
 				Id:      message.ID.Hex(),
@@ -182,10 +303,7 @@ func (s *Server) ChatStream(stream pb.ChatService_ChatStreamServer) error {
 				Type:    message.Type,
 				Content: in.Message.Content,
 				SentAt:  in.Message.SentAt,
-			},
-		}); err != nil {
-			return status.Errorf(codes.Unknown, err.Error())
-		}
+			}})
 
 	}
 }
@@ -221,8 +339,9 @@ func (s *Server) DirectChatRequestAction(c context.Context, r *pb.DirectChatActi
 				directChatRequest.Sender,
 				{Username: directChatRequest.Receiver.Username, ID: directChatRequest.Receiver.ID},
 			},
-			Type: pb.ChatType_CHAT_TYPE_DIRECT,
-			ID:   primitive.NewObjectID(),
+			Type:     pb.ChatType_CHAT_TYPE_DIRECT,
+			Messages: make([]models.Message, 0),
+			ID:       primitive.NewObjectID(),
 		}
 		err := s.Store.Add(c, CHATS_COLLECTION, &newChat)
 
