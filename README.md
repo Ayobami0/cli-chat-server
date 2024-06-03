@@ -1,1 +1,1 @@
-# A grpc server for [CliChat](https://github.com/Ayobami0/cli-chat) 
+# gGRPC server for [CliChat](https://github.com/Ayobami0/cli-chat-client)
