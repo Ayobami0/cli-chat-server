@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -25,8 +26,6 @@ import (
 )
 
 const (
-	DATABASE_NAME = "chat_db"
-
 	USERS_COLLECTION                = "users"
 	DIRECT_CHAT_REQUESTS_COLLECTION = "direct_chat_requests"
 	CHATS_COLLECTION                = "chats"
@@ -44,11 +43,16 @@ type Server struct {
 }
 
 func NewChatServer(storage store.Storage) *Server {
+	databaseName := os.Getenv("MONGO_NAME")
 
-	err := storage.Init(DATABASE_NAME)
+	if databaseName == "" {
+		log.Fatalf("MONGO_NAME variable is required")
+	}
+	err := storage.Init(databaseName)
 	if err != nil {
 		log.Fatalf(err.Error())
 	}
+	log.Println("Connected To Database")
 	return &Server{Store: storage, connections: map[string]map[string]pb.ChatService_ChatStreamServer{}, mu: sync.RWMutex{}}
 }
 
@@ -109,7 +113,7 @@ func (s *Server) LogIntoAccount(c context.Context, r *pb.UserRequest) (*pb.UserA
 	return &pb.UserAuthenticatedResponse{User: &pb.User{Username: user.Username, Id: user.ID.Hex()}, Token: token}, nil
 }
 
-func (s *Server) _isSession(key string) bool {
+func (s *Server) isSession(key string) bool {
 	_, ok := s.connections[key]
 
 	return ok
@@ -119,7 +123,7 @@ func (s *Server) broadcast(key string, message *pb.MessageStream) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if !s._isSession(key) {
+	if !s.isSession(key) {
 		return errors.New("Invalid session")
 	}
 
@@ -127,7 +131,6 @@ func (s *Server) broadcast(key string, message *pb.MessageStream) error {
 		if err := s.Send(message); err != nil {
 			return status.Errorf(codes.Unknown, err.Error())
 		}
-		log.Println(s)
 	}
 
 	return nil
@@ -136,7 +139,7 @@ func (s *Server) broadcast(key string, message *pb.MessageStream) error {
 func (s *Server) addStream(key string, user string, stream pb.ChatService_ChatStreamServer) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s._isSession(key) {
+	if !s.isSession(key) {
 		s.connections[key] = map[string]pb.ChatService_ChatStreamServer{}
 	}
 	s.connections[key][user] = stream
@@ -147,7 +150,7 @@ func (s *Server) removeSession(key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if !s._isSession(key) {
+	if !s.isSession(key) {
 		return errors.New("Invalid session")
 	}
 	if len(s.connections[key]) != 0 {
@@ -163,7 +166,7 @@ func (s *Server) removeStream(key, user string, stream pb.ChatService_ChatStream
 
 	conn := make([]pb.ChatService_ChatStreamServer, 0)
 
-	if !s._isSession(key) {
+	if !s.isSession(key) {
 		return errors.New("Invalid session")
 	}
 
@@ -174,6 +177,10 @@ func (s *Server) removeStream(key, user string, stream pb.ChatService_ChatStream
 	}
 
 	delete(s.connections[key], user)
+
+	if len(s.connections[key]) == 0 {
+		s.removeSession(key)
+	}
 
 	return nil
 }
@@ -245,7 +252,6 @@ func (s *Server) ChatStream(stream pb.ChatService_ChatStreamServer) error {
 		ChatId: cID[0],
 	})
 
-	log.Println(user.Username, "CONNECTED", s.connections)
 	// POST HANDSHAKE
 	for {
 		in, err := stream.Recv()
@@ -259,7 +265,6 @@ func (s *Server) ChatStream(stream pb.ChatService_ChatStreamServer) error {
 				},
 				ChatId: cID[0],
 			})
-			log.Println("DISCONNECTED", user.Username)
 			return nil
 		}
 		if err != nil {
@@ -409,15 +414,9 @@ func (s *Server) GetChats(c context.Context, r *emptypb.Empty) (*pb.ChatsRespons
 
 func (s *Server) JoinDirectChat(c context.Context, r *pb.JoinDirectChatRequest) (*pb.JoinDirectChatResponse, error) {
 	sender := c.Value(utils.USERNAME_HEADER).(models.User)
-	receiverId, err := primitive.ObjectIDFromHex(r.Receiver.Id)
-
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "Id is not an hexadecimal string")
-	}
 
 	receiver := models.User{
 		Username: r.Receiver.Username,
-		ID:       receiverId,
 	}
 	recvFilter := bson.D{{Key: "username", Value: receiver.Username}}
 
@@ -433,9 +432,27 @@ func (s *Server) JoinDirectChat(c context.Context, r *pb.JoinDirectChatRequest) 
 	if !exist {
 		return nil, status.Errorf(codes.NotFound, "User with username %s does not exist.", receiver.Username)
 	}
+	existingChatFilter := bson.D{
+		{Key: "type", Value: pb.ChatType_CHAT_TYPE_DIRECT},
+		{Key: "members.username", Value: bson.D{
+			{
+				Key:   "$all",
+				Value: bson.A{sender.Username, receiver.Username},
+			}},
+		},
+	}
 
-	existingFilter := bson.D{{Key: "sender", Value: sender}, {Key: "receiver", Value: receiver}}
-	match, err := s.Store.Exists(c, DIRECT_CHAT_REQUESTS_COLLECTION, existingFilter)
+	match, err := s.Store.Exists(c, CHATS_COLLECTION, existingChatFilter)
+
+	if err != nil {
+		return nil, status.Errorf(codes.Unknown, err.Error())
+	}
+	if match {
+		return nil, status.Errorf(codes.Aborted, "Cannot send request to an already existing chat")
+	}
+
+	existingRequestFilter := bson.D{{Key: "sender", Value: sender}, {Key: "receiver", Value: receiver}}
+	match, err = s.Store.Exists(c, DIRECT_CHAT_REQUESTS_COLLECTION, existingRequestFilter)
 
 	if err != nil {
 		return nil, status.Errorf(codes.Unknown, err.Error())

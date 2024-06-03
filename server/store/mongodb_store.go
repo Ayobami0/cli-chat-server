@@ -15,22 +15,20 @@ type MongoDBStorage struct {
 }
 
 func (m *MongoDBStorage) Init(dbName string) error {
-	var uri string
-
+	var pass, user string
 	switch os.Getenv("ENVIRONMENT") {
-	case "dev":
-		uri = os.Getenv("MONGODB_URI_DEV")
-	case "prod":
-		uri = os.Getenv("MONGODB_URI_PROD")
+	case "development":
+		pass = "root"
+		user = "root"
+	case "production":
+		pass = os.Getenv("MONGO_PASSWORD")
+		user = os.Getenv("MONGO_USERNAME")
 	default:
 		return fmt.Errorf("Invalid value for 'ENVIRONMENT'")
 	}
 
-	if uri == "" {
-		return fmt.Errorf("'MONGODB_URI' environment variable not set. " +
-			"See: " +
-			"www.mongodb.com/docs/drivers/go/current/usage-examples/#environment-variable")
-	}
+	uri := fmt.Sprintf("mongodb://%s:%s@mongodb", user, pass)
+
 	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(uri))
 	if err != nil {
 		return err

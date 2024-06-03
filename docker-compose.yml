@@ -1,0 +1,50 @@
+services:
+    grpc:
+      depends_on:
+        mongodb:
+            condition: service_healthy
+      networks:
+          - db
+      build: .
+      ports:
+        - "${PORT}:${PORT}"
+      env_file:
+        - path: .env
+      environment:
+          ENVIRONMENT: ${ENVIRONMENT}
+          STORAGE: ${STORAGE}
+          SECRET_KEY: ${SECRET_KEY}
+          PORT: ${PORT}
+          HOST: ${HOST}
+          MONGO_USERNAME: ${MONGO_USERNAME}
+          MONGO_PASSWORD: ${MONGO_PASSWORD}
+          MONGO_HOST: ${MONGO_HOST}
+          MONGO_PORT: ${MONGO_PORT}
+          MONGO_NAME: ${MONGO_NAME}
+      develop:
+        watch:
+          - action: sync
+            path: .
+            target: /usr/src/server
+    mongodb:
+      healthcheck:
+        test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+        interval: 10s
+        timeout: 10s
+        retries: 5
+      networks:
+        - db
+      image: "mongo"
+      restart: always
+      ports:
+        - "${MONGO_PORT}:${MONGO_PORT}"
+      environment:
+        MONGO_INITDB_ROOT_USERNAME: ${MONGO_USERNAME}
+        MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD}
+      volumes:
+        - 'mongo:/data/db'
+networks:
+  db:
+    driver: bridge
+volumes:
+  mongo:
